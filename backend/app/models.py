@@ -19,11 +19,11 @@ class Car(models.Model):
     year = models.IntegerField()
     color = models.CharField(max_length=30)
     price = models.DecimalField(max_digits=10, decimal_places=2)
-    is_used = models.BooleanField(default=True)
+    is_used = models.BooleanField(default=False)
 
     def __str__(self):
         """String representation used in the admin interface"""
         status = "Used" if self.is_used else "New"
-        return f"{self.manufacturer} {self.model_name} ({self.year}) - {status}"
+        return f"{self.id}  {self.manufacturer} {self.model_name} ({self.year}) - {status}"
 
     
