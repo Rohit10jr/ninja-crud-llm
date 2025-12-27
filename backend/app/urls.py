@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import api, home, text_view, AiView, CrudAiView
+from .views import api, home, text_view, AiView, CrudAiView, LangGraphAiCrudView
 
 urlpatterns = [
     path('home/', home, name='home'),
@@ -8,4 +8,5 @@ urlpatterns = [
     path('text-api/', text_view, name='text_view'),
     path('ai-rsp/', AiView.as_view(), name='text_view'),
     path('ai-car/', CrudAiView.as_view(), name='text_view'),
+    path('ai-crud/', LangGraphAiCrudView.as_view(), name='text_view'),
 ]

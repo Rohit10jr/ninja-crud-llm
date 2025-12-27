@@ -1,6 +1,9 @@
+import os 
 import json
-from typing import List
+import operator
+from typing import List, Literal
 from decimal import Decimal
+from typing_extensions import TypedDict, Annotated
 
 from django.forms.models import model_to_dict
 from django.shortcuts import render
@@ -18,7 +21,15 @@ from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_groq import ChatGroq
 from langchain_community.tools import DuckDuckGoSearchRun
-import os 
+from langgraph.checkpoint.postgres import PostgresSaver
+from langchain.messages import SystemMessage
+from langchain.messages import AnyMessage
+from langchain.messages import ToolMessage
+from langgraph.graph import StateGraph, START
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.messages import HumanMessage
+from langgraph.graph import END
+from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
 from .serializer import TextSerializer 
@@ -97,7 +108,6 @@ class AiView(APIView):
             ai_state = agent.invoke(
                 {"messages": [{"role": "user", "content": user_query}]}
             )
-            f"You submitted: {serializer.validated_data['text']}"
             final_answer = ai_state["messages"][-1].content
             return Response(
                 {"message": final_answer},
@@ -106,8 +116,21 @@ class AiView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-##################################################
+########################
+# AI CRUD Agent
+########################
 
+# # 1. Your PostgreSQL connection string
+# DB_URI = "postgresql://postgres:1234@localhost:5432/ninja_llm_crud?sslmode=disable"
+
+# # 2. Create a connection pool (best practice for production)
+# pool = ConnectionPool(conninfo=DB_URI, max_size=10)
+
+# # 3. Create the Saver (this is your memory engine)
+# # Note: You only need to call checkpointer.setup() ONCE ever to create tables
+# with pool.connection() as conn:
+#     checkpointer = PostgresSaver(conn)
+#     checkpointer.setup()
 
 car_model = ChatGroq(
     model = "openai/gpt-oss-120b",
@@ -204,6 +227,8 @@ def car_delete(car_id: int) -> dict:
     
 crud_agent = create_agent(car_model, tools=[car_get_all, car_get_one, car_post, car_update, car_delete, web_search], system_prompt="You are a helpful assistant that manages car records in a database and performs web search. Use the provided tools to perform CRUD operations on cars based on user requests.")
 
+# # Compile it with the checkpointer to enable memory
+# agent_with_memory = crud_agent.compile(checkpointer=checkpointer)
 
 class CrudAiView(APIView):
     def get(self, request):
@@ -212,16 +237,142 @@ class CrudAiView(APIView):
         serializer = TextSerializer(data=request.data)
         if serializer.is_valid():
             user_query = serializer.validated_data.get('text')
+
+            # agent without memory
             ai_state = crud_agent.invoke(
-                {"messages": [{"role": "user", "content": user_query}]}
-            )
-            f"You submitted: {serializer.validated_data['text']}"
+                {"messages": [{"role": "user", "content": user_query}]})
+             
+            # # agent with memory
+            # # UNIQUE ID for this chat session
+            # # This allows the AI to distinguish between User A and User B
+            # config = {"configurable": {"thread_id": "user_12345"}}
+
+            # # IMPORTANT: Invoke the 'compiled' agent with the config
+            # ai_state = agent_with_memory.invoke(
+            #     {"messages": [{"role": "user", "content": user_query}]},
+            #     config=config # <--- This links the request to the DB memory
+            # )
+
             final_answer = ai_state["messages"][-1].content
             return Response(
                 {"message": final_answer},
                 status=status.HTTP_200_OK
             )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+############################
+# AI CRUD langgraph Agent
+############################
+
+tools = [car_get_all, car_get_one, car_post, car_update, car_delete, web_search]
+tools_by_name = {t.name: t for t in tools}
+
+model_with_tools = car_model.bind_tools(tools)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+
+
+def llm_node(state: AgentState):
+    response = model_with_tools.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You are a CRUD assistant.\n"
+                    "Use tools to create, read, update, or delete items.\n"
+                    "Reply normally after tools finish."
+                )
+            )
+        ] + state["messages"]
+    )
+    return {"messages": [response]}
+
+
+def tool_node(state: AgentState):
+    results = []
+
+    last_message = state["messages"][-1]
+
+    for call in last_message.tool_calls:
+        tool = tools_by_name[call["name"]]
+        output = tool.invoke(call["args"])
+        results.append(
+            ToolMessage(
+                content=str(output),
+                tool_call_id=call["id"]
+            )
+        )
+
+    return {"messages": results}
+
+
+def should_continue(state: AgentState) -> Literal["tool_node", END]:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tool_node"
+    return END
+
+checkpointer = InMemorySaver()
+
+builder = StateGraph(AgentState)
+
+builder.add_node("llm", llm_node)
+builder.add_node("tool_node", tool_node)
+
+builder.add_edge(START, "llm")
+builder.add_conditional_edges(
+    "llm",
+    should_continue,
+    ["tool_node", END]
+)
+builder.add_edge("tool_node", "llm")
+
+graph_agent = builder.compile(checkpointer=checkpointer)
+
+config = {"configurable": {"thread_id": "crud-user-1"}}
+
+# result = graph_agent.invoke(
+#     {
+#         "messages": [
+#             HumanMessage(content="Create item with id=1 and name=Apple")
+#         ]
+#     },
+#     config=config
+# )
+
+
+
+class LangGraphAiCrudView(APIView):
+    def get(self, request):
+        return HttpResponse("Hello, this is the CAR AI CRUD endpoint.")
+    def post(self, request):
+        serializer = TextSerializer(data=request.data)
+        if serializer.is_valid():
+            user_query = serializer.validated_data.get('text')
+
+            # agent without memory
+            ai_state = graph_agent.invoke(
+                {
+                "messages": [
+                    HumanMessage(content=user_query)
+                    ]
+                },
+                config=config)
+
+            final_answer = ai_state["messages"][-1].content
+            return Response(
+                {"message": final_answer},
+                status=status.HTTP_200_OK
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+# for msg in result["messages"]:
+#     msg.pretty_print()
+
 
 
 api = NinjaAPI()
