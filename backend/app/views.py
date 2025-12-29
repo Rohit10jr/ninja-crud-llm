@@ -32,7 +32,7 @@ from langgraph.graph import END
 from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
-from .serializer import TextSerializer 
+from .serializer import TextSerializer
 from .schema import EmployeeIn, EmployeeOut, CarIn, CarOut, CarUpdate, CarCreateInput, CarUpdateInput, CarDeleteInput
 from .models import Employee, Car
 from google import genai
@@ -119,18 +119,6 @@ class AiView(APIView):
 ########################
 # AI CRUD Agent
 ########################
-
-# # 1. Your PostgreSQL connection string
-# DB_URI = "postgresql://postgres:1234@localhost:5432/ninja_llm_crud?sslmode=disable"
-
-# # 2. Create a connection pool (best practice for production)
-# pool = ConnectionPool(conninfo=DB_URI, max_size=10)
-
-# # 3. Create the Saver (this is your memory engine)
-# # Note: You only need to call checkpointer.setup() ONCE ever to create tables
-# with pool.connection() as conn:
-#     checkpointer = PostgresSaver(conn)
-#     checkpointer.setup()
 
 car_model = ChatGroq(
     model = "openai/gpt-oss-120b",
@@ -225,10 +213,20 @@ def car_delete(car_id: int) -> dict:
     return {"success": True, "deleted_car_id": car_id}
 
     
-crud_agent = create_agent(car_model, tools=[car_get_all, car_get_one, car_post, car_update, car_delete, web_search], system_prompt="You are a helpful assistant that manages car records in a database and performs web search. Use the provided tools to perform CRUD operations on cars based on user requests.")
+# crud_agent = create_agent(car_model, tools=[car_get_all, car_get_one, car_post, car_update, car_delete, web_search], checkpointer=InMemorySaver(), system_prompt="You are a helpful assistant that manages car records in a database and performs web search. Use the provided tools to perform CRUD operations on cars based on user requests.")
 
-# # Compile it with the checkpointer to enable memory
-# agent_with_memory = crud_agent.compile(checkpointer=checkpointer)
+
+# Compile it with the checkpointer to enable memory
+
+# 1. Your PostgreSQL connection string
+DB_URI = "postgresql://postgres:1234@localhost:5432/ninja_llm_crud?sslmode=disable"
+
+# with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+#     # Run this once to create the necessary tables
+#     checkpointer.setup()
+#     agent_with_memory = create_agent(car_model, tools=[car_get_all, car_get_one, car_post, car_update, car_delete, web_search], checkpointer=checkpointer, system_prompt="You are a helpful assistant that manages car records in a database and performs web search. Use the provided tools to perform CRUD operations on cars based on user requests.")
+
+
 
 class CrudAiView(APIView):
     def get(self, request):
@@ -239,25 +237,38 @@ class CrudAiView(APIView):
             user_query = serializer.validated_data.get('text')
 
             # agent without memory
-            ai_state = crud_agent.invoke(
-                {"messages": [{"role": "user", "content": user_query}]})
+            # ai_state = crud_agent.invoke(
+            #     {"messages": [{"role": "user", "content": user_query}]})
              
-            # # agent with memory
+            # agent with memory
             # # UNIQUE ID for this chat session
             # # This allows the AI to distinguish between User A and User B
             # config = {"configurable": {"thread_id": "user_12345"}}
 
             # # IMPORTANT: Invoke the 'compiled' agent with the config
-            # ai_state = agent_with_memory.invoke(
+            # ai_state = crud_agent.invoke(
             #     {"messages": [{"role": "user", "content": user_query}]},
-            #     config=config # <--- This links the request to the DB memory
+            #     config=config
             # )
+
+            # agent with database memory
+            with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+                # Run this once to create the necessary tables
+                # checkpointer.setup()
+                agent_with_memory = create_agent(car_model, tools=[car_get_all, car_get_one, car_post, car_update, car_delete, web_search], checkpointer=checkpointer, system_prompt="You are a helpful assistant that manages car records in a database and performs web search. Use the provided tools to perform CRUD operations on cars based on user requests.")
+
+                config = {"configurable": {"thread_id": "user_12345"}}
+
+                ai_state = agent_with_memory.invoke(
+                    {"messages": [{"role": "user", "content": user_query}]},
+                    config=config
+                )
 
             final_answer = ai_state["messages"][-1].content
             return Response(
-                {"message": final_answer},
-                status=status.HTTP_200_OK
-            )
+                    {"message": final_answer},
+                    status=status.HTTP_200_OK
+                )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -341,7 +352,6 @@ config = {"configurable": {"thread_id": "crud-user-1"}}
 #     },
 #     config=config
 # )
-
 
 
 class LangGraphAiCrudView(APIView):
